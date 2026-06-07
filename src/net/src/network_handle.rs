@@ -26,6 +26,7 @@ use std::sync::Arc;
 use crate::network_execution::NetworkCmdExecution;
 use bytes::Bytes;
 use client::Client;
+use cmd::CmdFlags;
 use cmd::table::CmdTable;
 use executor::CmdExecutor;
 use log::{debug, error, warn};
@@ -48,6 +49,7 @@ pub async fn process_network_connection(
     storage_client: Arc<StorageClient>,
     cmd_table: Arc<CmdTable>,
     executor: Arc<CmdExecutor>,
+    leader_gate: Option<std::sync::Arc<dyn raft::leader_gate::LeaderGate>>,
 ) -> std::io::Result<()> {
     let mut buf = vec![0; 4096]; // Increased buffer size for better performance
     let mut resp_parser = resp::RespParse::new(resp::RespVersion::RESP2);
@@ -70,6 +72,7 @@ pub async fn process_network_connection(
                                     storage_client.clone(),
                                     cmd_table.clone(),
                                     executor.clone(),
+                                    leader_gate.clone(),
                                 ).await;
                             }
                             return Ok(());
@@ -96,6 +99,7 @@ pub async fn process_network_connection(
                                                 storage_client.clone(),
                                                 cmd_table.clone(),
                                                 executor.clone(),
+                                                leader_gate.clone(),
                                             ).await;
                                             pending_commands.clear();
                                         }
@@ -123,6 +127,7 @@ pub async fn process_network_connection(
                                 storage_client.clone(),
                                 cmd_table.clone(),
                                 executor.clone(),
+                                leader_gate.clone(),
                             ).await;
                             pending_commands.clear();
                         }
@@ -150,6 +155,7 @@ async fn handle_network_command(
     storage_client: Arc<StorageClient>,
     cmd_table: Arc<CmdTable>,
     executor: Arc<CmdExecutor>,
+    leader_gate: Option<std::sync::Arc<dyn raft::leader_gate::LeaderGate>>,
 ) {
     // Convert the command name from &[u8] to a lowercase String for lookup
     let cmd_name = String::from_utf8_lossy(&client.cmd_name()).to_lowercase();
@@ -163,6 +169,7 @@ async fn handle_network_command(
             cmd: cmd.clone(),
             client: client.clone(),
             storage_client: storage_client.clone(),
+            leader_gate: leader_gate.clone(),
         };
 
         // Execute the command using the network-aware executor
@@ -339,6 +346,7 @@ async fn process_command_batch(
     storage_client: Arc<StorageClient>,
     cmd_table: Arc<CmdTable>,
     executor: Arc<CmdExecutor>,
+    leader_gate: Option<std::sync::Arc<dyn raft::leader_gate::LeaderGate>>,
 ) {
     debug!("Processing command batch of {} commands", commands.len());
 
@@ -349,12 +357,28 @@ async fn process_command_batch(
         client.set_cmd_name(&command.cmd_name);
         client.set_argv(&command.argv);
 
+        // Auth check: deny non-NO_AUTH commands when not authenticated
+        if !client.is_authenticated() {
+            let cmd_name_str = String::from_utf8_lossy(&command.cmd_name).to_lowercase();
+            if let Some(cmd) = cmd_table.get(&cmd_name_str) {
+                if !cmd.has_flag(CmdFlags::NO_AUTH) {
+                    client.set_reply(RespData::Error("NOAUTH Authentication required.".into()));
+                    let response = client.take_reply();
+                    let mut encoder = RespEncoder::new(RespVersion::RESP2);
+                    encoder.encode_resp_data(&response);
+                    let _ = client.write(encoder.get_response().as_ref()).await;
+                    continue;
+                }
+            }
+        }
+
         // Handle the command
         handle_network_command(
             client.clone(),
             storage_client.clone(),
             cmd_table.clone(),
             executor.clone(),
+            leader_gate.clone(),
         )
         .await;
 
@@ -482,7 +506,7 @@ mod tests {
             Duration::from_secs(30),
         ));
         let storage_client = Arc::new(crate::storage_client::StorageClient::new(runtime_client));
-        let cmd_table = Arc::new(create_command_table());
+        let cmd_table = Arc::new(create_command_table(Arc::new(|| None)));
         let executor = Arc::new(CmdExecutorBuilder::new().build());
 
         (storage_client, cmd_table, executor)

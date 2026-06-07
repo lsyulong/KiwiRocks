@@ -22,8 +22,10 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
+use cmd::CmdFlags;
 use executor::CmdExecutor;
 use log::{debug, error, warn};
 use resp::RespData;
@@ -55,6 +57,22 @@ impl CmdExecutorNetworkExt for CmdExecutor {
                 let error_msg = format!("ERR wrong number of arguments for '{}' command", cmd_name);
                 exec.client.set_reply(RespData::Error(error_msg.into()));
                 return Ok(());
+            }
+
+            // Cluster-mode leader gate: reject writes on non-leaders before any
+            // command-specific setup runs.
+            if let Some(gate) = exec.leader_gate.as_ref() {
+                if exec.cmd.has_flag(CmdFlags::WRITE) && !gate.is_leader() {
+                    // Simplified redirect: Kiwi returns "MOVED <addr>" (no hash slot,
+                    // unlike Redis Cluster's "MOVED <slot> <ip:port>"). Clients are
+                    // expected to reconnect to the returned leader address directly.
+                    let reply = match gate.leader_resp_addr() {
+                        Some(addr) => format!("MOVED {addr}"),
+                        None => "ERR not leader".to_string(),
+                    };
+                    exec.client.set_reply(RespData::Error(reply.into()));
+                    return Ok(());
+                }
             }
 
             // Execute do_initial if needed
@@ -103,6 +121,9 @@ impl CmdExecutorNetworkExt for CmdExecutor {
                 }
                 "ping" => {
                     execute_ping_command(&exec).await?;
+                }
+                "auth" => {
+                    execute_auth_command(&exec).await?;
                 }
                 _ => {
                     // For unsupported commands, return an error
@@ -418,6 +439,17 @@ async fn execute_ping_command(exec: &NetworkCmdExecution) -> Result<(), DualRunt
             "ERR wrong number of arguments for 'ping' command".into(),
         ));
     }
+    Ok(())
+}
+
+/// Execute AUTH command asynchronously (doesn't require storage)
+async fn execute_auth_command(exec: &NetworkCmdExecution) -> Result<(), DualRuntimeError> {
+    debug!("Executing AUTH command");
+
+    // AuthCmd doesn't use storage, so pass a dummy Arc with valid instance number
+    let dummy_storage = Arc::new(storage::storage::Storage::new(1, 0));
+    exec.cmd.execute(&exec.client, dummy_storage);
+
     Ok(())
 }
 
